@@ -1,0 +1,99 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Java 17 (Android Gradle plugin requires it)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip \
+            autoconf libtool pkg-config zlib1g-dev libncurses5-dev \
+            libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev \
+            build-essential ccache
+
+      - name: Install buildozer & cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython==0.29.36
+
+      - name: Pre-fetch freetype (Savannah mirror is unreliable on CI)
+        run: |
+          DEST="$GITHUB_WORKSPACE/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/packages/freetype"
+          mkdir -p "$DEST"
+          cd "$DEST"
+          curl -L --fail --retry 5 --retry-delay 5 -o freetype-2.14.1.tar.gz \
+            https://distfiles.gentoo.org/distfiles/freetype-2.14.1.tar.gz \
+          || curl -L --fail --retry 5 --retry-delay 5 -o freetype-2.14.1.tar.gz \
+            https://download.savannah.gnu.org/releases/freetype/freetype-2.14.1.tar.gz
+          ls -la
+
+      - name: Use local reportlab recipe (hg.reportlab.com blocks CI downloads)
+        run: |
+          sed -i '/^requirements = /a p4a.local_recipes = '"$GITHUB_WORKSPACE"'/p4a-recipes' buildozer.spec
+          echo "---- buildozer.spec ----"
+          cat buildozer.spec
+
+      - name: Patch python-for-android (skip broken pip self-upgrade + add FileProvider)
+        run: |
+          # 1) python-for-android's run_pymodules_install() runs
+          # "pip install -U pip" inside a fresh venv. On this Python
+          # version that self-upgrade corrupts pip's own installed files
+          # (ImportError: cannot import name 'BuildDependencyInstallError'),
+          # failing the build. We clone p4a ourselves and neutralize that
+          # one line so pip stays at the version already bundled in the venv.
+          git clone https://github.com/kivy/python-for-android.git "$GITHUB_WORKSPACE/p4a-src"
+          sed -i 's/pip install -U pip/true/' "$GITHUB_WORKSPACE/p4a-src/pythonforandroid/build.py"
+          echo "---- verifying pip patch (should print nothing) ----"
+          grep -n "pip install -U pip" "$GITHUB_WORKSPACE/p4a-src/pythonforandroid/build.py" || echo "OK: no self-upgrade line left"
+
+          # 2) Modern Android refuses to hand a raw file:// path to the
+          # camera app / share targets (FileUriExposedException). Add a
+          # FileProvider to the manifest template (buildozer.spec's own
+          # android.res_xml option registers file_paths.xml as a proper
+          # resource, so we only need to touch the manifest here).
+          # p4a ships several bootstraps (sdl2, webview, service_only...),
+          # each with its own AndroidManifest.tmpl.xml - patch ALL of them
+          # so it doesn't matter which one this build actually uses.
+          while IFS= read -r MANIFEST_TMPL; do
+            echo "Patching manifest template at: $MANIFEST_TMPL"
+            python3 "$GITHUB_WORKSPACE/scripts/patch_p4a_fileprovider.py" "$MANIFEST_TMPL"
+          done < <(find "$GITHUB_WORKSPACE/p4a-src" -name "AndroidManifest.tmpl.xml")
+
+          sed -i '/^p4a.branch/d' buildozer.spec
+          sed -i '/^requirements = /a p4a.source_dir = '"$GITHUB_WORKSPACE"'/p4a-src' buildozer.spec
+          echo "---- buildozer.spec ----"
+          cat buildozer.spec
+
+      - name: Build APK with buildozer
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          max_attempts: 3
+          retry_wait_seconds: 120
+          command: yes | buildozer -v android debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: medicine-scanner-apk
+          path: bin/*.apk
